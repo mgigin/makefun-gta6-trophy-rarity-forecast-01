@@ -1,19 +1,18 @@
-// gta6-trophy-rarity-forecast-01 entry: earners-and-players trend forecaster (Node 22+, standard library only).
+// gta6-trophy-rarity-forecast-01 entry v2: counts-anchored trend forecaster (Node 22+, standard library only).
 //
-// Idea: a trophy's rarity rate is earners / tracked players. The two move for different reasons in the first
-// week after launch — the tracked-player count jumps in steps as the tracker refreshes, while earners climb
-// smoothly as players progress. So instead of extrapolating the rate directly, this program models the two
-// parts separately and divides:
+// A trophy's printed rate is a count ratio: earners / tracked players, rounded to 2 decimals. Earners are
+// cumulative integers (they never decrease); tracked players jump upward at Exophase refreshes. So this
+// program forecasts the two counts separately and divides, but unlike a plain whole-history trend fit it:
 //
-//   * players(t):  log players against log(1 + hours since the first read), one global fit over all reads.
-//   * earners_i(t): log(1 + earners) against log(1 + hours) per trophy, with the slope shrunk toward the
-//     average slope of the trophy's tier (bronze/silver/gold/platinum) when the trophy has few reads or a
-//     noisy fit. Earners are recovered from each read as rate/100 * players_tracked.
-//
-// The median forecast is earners(target) / players(target). Uncertainty is put on the logit scale: a pooled
-// residual scale from the per-trophy fits, grown with sqrt(horizon in days) and floored so flat practice
-// histories do not produce overconfident quantiles. Quantiles use the standard normal's z at the five levels
-// the contest scores (0.05, 0.25, 0.5, 0.75, 0.95).
+//   * recovers integer earners from each read (round(rate/100 * players)) instead of fitting noisy rates;
+//   * fits log-count trends against log(1 + hours since the first read) on a recent window only (last 72h),
+//     so the frozen launch-night segment does not flatten the slopes that matter for the final's horizon;
+//   * anchors every forecast at the last observed count and applies the (tier-shrunk) slope over the
+//     remaining log-time gap, so shrinkage cannot bias the level away from the latest read;
+//   * never lets earners fall below their last count, and caps them at the players forecast;
+//   * sizes the logit-scale spread from three parts: a base term, pooled fit residuals, a horizon term
+//     growing with sqrt(days), and a count-noise term ~ 1/sqrt(earners + 1) so rare trophies (a handful
+//     of earners) get honestly wider quantiles than common ones.
 //
 // Deterministic: same input bytes, same output bytes. No network, no clock, no randomness.
 
@@ -39,14 +38,14 @@ const clampRate = (x: number): number => Math.min(99.99, Math.max(0.01, x));
 const logit = (pct: number): number => Math.log(clampRate(pct) / (100 - clampRate(pct)));
 const invLogit = (x: number): number => 100 / (1 + Math.exp(-x));
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
+const clamp = (x: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, x));
 
-interface Fit { a: number; b: number; resid: number; n: number }
+interface Fit { b: number; resid: number; n: number }
 
-/** Ordinary least squares y ~ a + b*x; resid is the residual standard deviation (0 with <3 points). */
-function ols(xs: number[], ys: number[]): Fit {
+/** Slope and residual sd of y ~ a + b*x by least squares (level is re-anchored later, so `a` is unused). */
+function slopeFit(xs: number[], ys: number[]): Fit {
   const n = xs.length;
-  if (n === 0) return { a: 0, b: 0, resid: 0, n: 0 };
-  if (n === 1) return { a: ys[0], b: 0, resid: 0, n: 1 };
+  if (n < 2) return { b: 0, resid: 0, n };
   const mx = xs.reduce((s, v) => s + v, 0) / n;
   const my = ys.reduce((s, v) => s + v, 0) / n;
   let sxx = 0;
@@ -59,7 +58,7 @@ function ols(xs: number[], ys: number[]): Fit {
   const a = my - b * mx;
   let ss = 0;
   for (let i = 0; i < n; i++) ss += (ys[i] - (a + b * xs[i])) ** 2;
-  return { a, b, resid: n > 2 ? Math.sqrt(ss / (n - 2)) : 0, n };
+  return { b, resid: n > 2 ? Math.sqrt(ss / (n - 2)) : 0, n };
 }
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -74,75 +73,98 @@ for (const file of inputs) {
   const t0 = Date.parse(reads[0].slot);
   const hours = reads.map((r) => Math.max(0, (Date.parse(r.slot) - t0) / 3_600_000));
   const xOf = (h: number): number => Math.log1p(h);
-  const targetHours = Math.max(0, (Date.parse(c.target) - t0) / 3_600_000);
-  const xTarget = xOf(targetHours);
+  const xLast = xOf(hours[hours.length - 1]);
+  const xTarget = xOf(Math.max(0, (Date.parse(c.target) - t0) / 3_600_000));
+  const dx = Math.max(0, xTarget - xLast);
   const horizonDays = Math.max(0, c.horizon_minutes / 1440);
 
-  // Global tracked-players curve.
-  const pFit = ols(hours.map(xOf), reads.map((r) => Math.log(Math.max(1, r.players_tracked))));
+  // Recent window for slope fits: reads from the last 72 hours before the checkpoint, all reads if sparse.
+  const atMs = Date.parse(c.at);
+  let winStart = 0;
+  for (let j = 0; j < reads.length; j++) {
+    if (Date.parse(reads[j].slot) >= atMs - 72 * 3_600_000) { winStart = j; break; }
+    winStart = j;
+  }
+  if (reads.length - winStart < 8) winStart = 0;
+
+  // Tracked players: recent log-trend, anchored at the last read, never shrinking.
+  const pXs: number[] = [];
+  const pYs: number[] = [];
+  for (let j = winStart; j < reads.length; j++) {
+    pXs.push(xOf(hours[j]));
+    pYs.push(Math.log(Math.max(1, reads[j].players_tracked)));
+  }
+  const pFit = slopeFit(pXs, pYs);
   const playersNow = Math.max(1, reads[reads.length - 1].players_tracked);
-  // Cap the players forecast: at most a doubling per day of horizon, never below the last read's count.
-  const playersForecast = Math.min(
-    Math.max(playersNow, Math.exp(pFit.a + pFit.b * xTarget)),
-    playersNow * Math.pow(2, Math.max(1, horizonDays)),
+  const playersForecast = clamp(
+    playersNow * Math.exp(clamp(pFit.b, 0, 3) * dx),
+    playersNow,
+    playersNow * 40,
   );
 
-  // Per-trophy earners fits, then tier-average slopes for shrinkage.
+  // Per-trophy integer earners and recent log-trend slopes.
   const fits: Fit[] = [];
-  const lastRates: number[] = [];
   const lastEarners: number[] = [];
+  const lastRates: number[] = [];
   for (let i = 0; i < c.trophies.length; i++) {
     const xs: number[] = [];
     const ys: number[] = [];
-    let lastRate = 0;
     let lastEarn = 0;
+    let lastRate = 0;
     for (let j = 0; j < reads.length; j++) {
       const rate = reads[j].rates[i];
       if (rate === null || rate === undefined) continue;
-      const earners = (rate / 100) * Math.max(1, reads[j].players_tracked);
-      xs.push(xOf(hours[j]));
-      ys.push(Math.log1p(earners));
-      lastRate = rate;
+      const earners = Math.round((rate / 100) * Math.max(1, reads[j].players_tracked));
+      if (j >= winStart) {
+        xs.push(xOf(hours[j]));
+        ys.push(Math.log1p(earners));
+      }
       lastEarn = earners;
+      lastRate = rate;
     }
-    fits.push(ols(xs, ys));
-    lastRates.push(lastRate);
+    fits.push(slopeFit(xs, ys));
     lastEarners.push(lastEarn);
+    lastRates.push(lastRate);
   }
 
   const tierSlope = new Map<string, { sum: number; n: number }>();
   c.trophies.forEach((t, i) => {
-    if (fits[i].n < 3) return;
+    if (fits[i].n < 4) return;
     const cur = tierSlope.get(t.tier) ?? { sum: 0, n: 0 };
     cur.sum += fits[i].b;
     cur.n += 1;
     tierSlope.set(t.tier, cur);
   });
 
-  // Pooled residual scale on the logit scale (converted from log-earners residuals, roughly 1:1 at low rates).
-  const residPool = fits.filter((f) => f.n >= 3).map((f) => f.resid);
-  const pooled = residPool.length > 0 ? residPool.reduce((s, v) => s + v, 0) / residPool.length : 0.2;
-  const sigma = Math.min(1.2, Math.max(0.18, pooled) + 0.42 * Math.sqrt(horizonDays));
+  // Pooled residual scale from the recent earners fits (log-count residuals track logit residuals at low rates).
+  const residPool = fits.filter((f) => f.n >= 4).map((f) => f.resid);
+  const pooled = residPool.length > 0 ? residPool.reduce((s, v) => s + v, 0) / residPool.length : 0.25;
+  const horizonTerm = 0.32 * Math.sqrt(horizonDays);
 
   const trophies = c.trophies.map((t, i) => {
     const fit = fits[i];
     const tier = tierSlope.get(t.tier);
     const tierB = tier && tier.n > 0 ? tier.sum / tier.n : fit.b;
-    // Shrinkage weight: more reads, less shrinkage. Clamp the slope so a short noisy history
-    // cannot extrapolate into an explosive earners curve over a multi-day horizon.
-    const w = Math.min(1, fit.n / 12);
-    const slope = Math.min(3, Math.max(-0.5, w * fit.b + (1 - w) * tierB));
-    const earnersForecast = Math.max(
-      lastEarners[i],
-      Math.expm1(fit.a + slope * xTarget),
-    );
+    const w = fit.n / (fit.n + 10);
+    const slope = clamp(w * fit.b + (1 - w) * tierB, -0.3, 3.5);
+    const eLast = lastEarners[i];
+    let earnersForecast = Math.expm1(Math.log1p(eLast) + slope * dx);
+    earnersForecast = Math.max(earnersForecast, eLast); // earners are cumulative: never decrease
+    earnersForecast = Math.min(earnersForecast, playersForecast);
+    if (eLast === 0) earnersForecast = 0.25; // nobody yet: expect a fraction of one earner
+
     let median = (100 * earnersForecast) / playersForecast;
-    // A trophy nobody has earned yet stays near zero; give it a small tier-based ceiling instead of a trend.
-    if (lastEarners[i] < 0.5) median = Math.min(median, 100 / playersForecast);
+    if (lastRates[i] >= 99.99) median = 99.95; // the everyone-has-it trophy stays at the top
     median = clampRate(median);
+
+    const countNoise = 0.85 / Math.sqrt(eLast + 1);
+    const sigma = clamp(
+      Math.sqrt(0.22 ** 2 + 0.5 * pooled ** 2 + horizonTerm ** 2 + countNoise ** 2),
+      0.25,
+      1.7,
+    );
     const l = logit(median);
     const q = Z.map((z) => round4(Math.min(100, Math.max(0, invLogit(l + z * sigma)))));
-    // Enforce non-decreasing after rounding.
     for (let k = 1; k < q.length; k++) if (q[k] < q[k - 1]) q[k] = q[k - 1];
     return { id: t.id, q };
   });
