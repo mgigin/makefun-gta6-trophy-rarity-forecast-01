@@ -91,6 +91,7 @@ for (const file of inputs) {
   const pXs: number[] = [];
   const pYs: number[] = [];
   for (let j = winStart; j < reads.length; j++) {
+    if (!(reads[j].players_tracked > 0)) continue; // a zero-player read carries no ratio information
     pXs.push(xOf(hours[j]));
     pYs.push(Math.log(Math.max(1, reads[j].players_tracked)));
   }
@@ -114,6 +115,7 @@ for (const file of inputs) {
     for (let j = 0; j < reads.length; j++) {
       const rate = reads[j].rates[i];
       if (rate === null || rate === undefined) continue;
+      if (!(reads[j].players_tracked > 0)) continue; // rate/100 * 0 players would fake a zero-earner read
       const earners = Math.round((rate / 100) * Math.max(1, reads[j].players_tracked));
       if (j >= winStart) {
         xs.push(xOf(hours[j]));
